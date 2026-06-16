@@ -132,6 +132,35 @@ pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
     }
 }
 
+/// Apply Rotary Position Embeddings (RoPE) in-place.
+///
+/// `x` is `[seq_len, n_heads, head_dim]` in row-major order. The rotation is
+/// applied to the first `rope_dim` dimensions of each head, using positions
+/// `0..seq_len`.
+pub fn rope(x: &mut [f32], seq_len: usize, n_heads: usize, head_dim: usize, rope_dim: usize, base: f32) {
+    assert_eq!(x.len(), seq_len * n_heads * head_dim, "rope shape mismatch");
+    assert!(rope_dim <= head_dim, "rope_dim must not exceed head_dim");
+    assert!(rope_dim.is_multiple_of(2), "rope_dim must be even");
+
+    for pos in 0..seq_len {
+        for h in 0..n_heads {
+            let head_offset = (pos * n_heads + h) * head_dim;
+            for i in (0..rope_dim).step_by(2) {
+                let idx = head_offset + i;
+                let a = x[idx];
+                let b = x[idx + 1];
+
+                let inv_freq = 1.0 / base.powf(i as f32 / rope_dim as f32);
+                let angle = pos as f32 * inv_freq;
+                let (sin, cos) = angle.sin_cos();
+
+                x[idx] = a * cos - b * sin;
+                x[idx + 1] = a * sin + b * cos;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,8 +8,10 @@ use crate::gguf::{GgufFile, Weights};
 use std::path::Path;
 
 pub use self::config::Config;
+pub use self::forward::LayerBuffers;
 
 mod config;
+mod forward;
 
 /// A single transformer layer's weight tensor indices.
 #[derive(Clone, Debug, PartialEq)]
