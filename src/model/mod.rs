@@ -7,9 +7,11 @@
 use crate::gguf::{GgufFile, Weights};
 use std::path::Path;
 
+pub use self::cache::{DecodeBuffers, KvCache};
 pub use self::config::Config;
 pub use self::forward::LayerBuffers;
 
+mod cache;
 mod config;
 mod forward;
 

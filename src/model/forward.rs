@@ -2,6 +2,7 @@
 
 use crate::gguf::Result;
 use crate::model::{Config, Layer, Model};
+use crate::model::cache::{DecodeBuffers, KvCache};
 use crate::ops::{
     add_in_place, embedding_lookup, matmul_t, rms_norm, rope, softmax_rows, swiglu,
 };
@@ -204,6 +205,109 @@ impl Layer {
 
         Ok(())
     }
+
+    /// Run one transformer layer decode step in-place on a single token.
+    ///
+    /// Operates on `buf.hidden`, which has shape `[hidden_size]`. The KV-cache
+    /// for this layer is updated with the new token's key and value before
+    /// attention is computed.
+    pub fn decode_step(
+        &self,
+        model: &Model,
+        kv_cache: &mut [f32],
+        v_cache: &mut [f32],
+        cache_len: usize,
+        buf: &mut DecodeBuffers,
+    ) -> Result<()> {
+        let cfg = &model.config;
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        let kv_group_size = cfg.n_heads / cfg.n_kv_heads;
+
+        // --- Attention branch ---
+        buf.residual.copy_from_slice(&buf.hidden);
+
+        let attn_norm = model.weights.tensor_f32_by_index(self.attn_norm)?;
+        rms_norm(&mut buf.hidden, &attn_norm, cfg.norm_eps);
+
+        let w_q = model.weights.tensor_f32_by_index(self.attn_q)?;
+        let w_k = model.weights.tensor_f32_by_index(self.attn_k)?;
+        let w_v = model.weights.tensor_f32_by_index(self.attn_v)?;
+
+        matmul_t(&buf.hidden, &w_q, &mut buf.q, 1, cfg.hidden_size, cfg.hidden_size);
+        matmul_t(&buf.hidden, &w_k, &mut buf.k, 1, kv_dim, cfg.hidden_size);
+        matmul_t(&buf.hidden, &w_v, &mut buf.v, 1, kv_dim, cfg.hidden_size);
+
+        // RoPE at the current cache position
+        rope(&mut buf.q, 1, cfg.n_heads, cfg.head_dim, cfg.rope_dim, cfg.rope_base);
+        rope(&mut buf.k, 1, cfg.n_kv_heads, cfg.head_dim, cfg.rope_dim, cfg.rope_base);
+
+        // Append k and v to the cache
+        let kv_offset = cache_len * kv_dim;
+        kv_cache[kv_offset..kv_offset + kv_dim].copy_from_slice(&buf.k);
+        v_cache[kv_offset..kv_offset + kv_dim].copy_from_slice(&buf.v);
+        let new_cache_len = cache_len + 1;
+
+        // Multi-head attention with GQA over the cached sequence
+        buf.attn_out.fill(0.0);
+
+        for h_q in 0..cfg.n_heads {
+            let h_kv = h_q / kv_group_size;
+            let q_offset = h_q * cfg.head_dim;
+            let q_head = &buf.q[q_offset..q_offset + cfg.head_dim];
+
+            for t in 0..new_cache_len {
+                let k_offset = t * kv_dim + h_kv * cfg.head_dim;
+                let k_head = &kv_cache[k_offset..k_offset + cfg.head_dim];
+
+                let mut score = 0.0f32;
+                for (&q_val, &k_val) in q_head.iter().zip(k_head) {
+                    score += q_val * k_val;
+                }
+                buf.scores[t] = score / (cfg.head_dim as f32).sqrt();
+            }
+
+            softmax_rows(&mut buf.scores[..new_cache_len], 1, new_cache_len);
+
+            buf.head_out[..cfg.head_dim].fill(0.0);
+            for t in 0..new_cache_len {
+                let score = buf.scores[t];
+                let v_offset = t * kv_dim + h_kv * cfg.head_dim;
+                let v_head = &v_cache[v_offset..v_offset + cfg.head_dim];
+                for (d, &v_val) in v_head.iter().enumerate() {
+                    buf.head_out[d] += score * v_val;
+                }
+            }
+
+            let attn_offset = h_q * cfg.head_dim;
+            buf.attn_out[attn_offset..attn_offset + cfg.head_dim]
+                .copy_from_slice(&buf.head_out[..cfg.head_dim]);
+        }
+
+        // Output projection
+        let w_o = model.weights.tensor_f32_by_index(self.attn_output)?;
+        matmul_t(&buf.attn_out, &w_o, &mut buf.hidden, 1, cfg.hidden_size, cfg.hidden_size);
+        add_in_place(&mut buf.hidden, &buf.residual);
+
+        // --- FFN branch ---
+        buf.residual.copy_from_slice(&buf.hidden);
+
+        let ffn_norm = model.weights.tensor_f32_by_index(self.ffn_norm)?;
+        rms_norm(&mut buf.hidden, &ffn_norm, cfg.norm_eps);
+
+        let w_gate = model.weights.tensor_f32_by_index(self.ffn_gate)?;
+        let w_up = model.weights.tensor_f32_by_index(self.ffn_up)?;
+        let w_down = model.weights.tensor_f32_by_index(self.ffn_down)?;
+
+        matmul_t(&buf.hidden, &w_gate, &mut buf.ffn_gate, 1, cfg.intermediate_size, cfg.hidden_size);
+        matmul_t(&buf.hidden, &w_up, &mut buf.ffn_up, 1, cfg.intermediate_size, cfg.hidden_size);
+        swiglu(&buf.ffn_gate, &buf.ffn_up, &mut buf.ffn_mid);
+        matmul_t(&buf.ffn_mid, &w_down, &mut buf.ffn_down, 1, cfg.hidden_size, cfg.intermediate_size);
+
+        buf.hidden.copy_from_slice(&buf.ffn_down);
+        add_in_place(&mut buf.hidden, &buf.residual);
+
+        Ok(())
+    }
 }
 
 impl Model {
@@ -254,6 +358,90 @@ impl Model {
         let start = all_logits.len() - vocab_size;
         Ok(all_logits[start..].to_vec())
     }
+
+    /// Run one autoregressive decode step for a single token id.
+    ///
+    /// Updates `kv_cache` and returns a slice to the logits for the next token.
+    pub fn decode_step<'a>(
+        &self,
+        token_id: u32,
+        kv_cache: &mut KvCache,
+        buf: &'a mut DecodeBuffers,
+    ) -> Result<&'a [f32]> {
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size as usize;
+
+        if token_id as usize >= vocab_size {
+            return Err(crate::gguf::Error::InvalidTensorIndex(token_id as usize));
+        }
+
+        let embeddings = self.weights.tensor_f32_by_index(self.token_embeddings)?;
+        let src = token_id as usize * hidden_size;
+        buf.hidden.copy_from_slice(&embeddings[src..src + hidden_size]);
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            layer.decode_step(
+                self,
+                &mut kv_cache.k[layer_idx],
+                &mut kv_cache.v[layer_idx],
+                kv_cache.len,
+                buf,
+            )?;
+        }
+
+        let output_norm = self.weights.tensor_f32_by_index(self.output_norm)?;
+        rms_norm(&mut buf.hidden, &output_norm, self.config.norm_eps);
+
+        let output_idx = self.output.unwrap_or(self.token_embeddings);
+        let output_weight = self.weights.tensor_f32_by_index(output_idx)?;
+        matmul_t(
+            &buf.hidden,
+            &output_weight,
+            &mut buf.logits,
+            1,
+            vocab_size,
+            hidden_size,
+        );
+
+        kv_cache.len += 1;
+        Ok(&buf.logits)
+    }
+
+    /// Greedy autoregressive generation from a prompt.
+    ///
+    /// Returns the generated token ids. `kv_cache` and `buf` must be sized for
+    /// the model and a large enough context length.
+    pub fn generate(
+        &self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        kv_cache: &mut KvCache,
+        buf: &mut DecodeBuffers,
+    ) -> Result<Vec<u32>> {
+        let mut generated = Vec::new();
+        kv_cache.clear();
+
+        for &token in prompt_tokens {
+            self.decode_step(token, kv_cache, buf)?;
+        }
+
+        for _ in 0..max_tokens {
+            let next_token = argmax(&buf.logits);
+            generated.push(next_token);
+            self.decode_step(next_token, kv_cache, buf)?;
+        }
+
+        Ok(generated)
+    }
+}
+
+fn argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -414,6 +602,61 @@ mod tests {
 
         let logits = model.forward(&[0]).unwrap();
         assert_eq!(logits.len(), 100); // vocab_size
+
+        fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn generate_with_kv_cache_runs() {
+        let tmp = std::env::temp_dir().join("inferox_generate_test.gguf");
+
+        let hidden_size = 8usize;
+        let intermediate_size = 16usize;
+        let n_layers = 1usize;
+        let max_seq_len = 32usize;
+
+        let mut builder = TestGgufBuilder::new();
+        builder
+            .metadata_string("general.architecture", "llama")
+            .metadata_u32("llama.vocab_size", 100)
+            .metadata_u32("llama.embedding_length", hidden_size as u32)
+            .metadata_u32("llama.block_count", n_layers as u32)
+            .metadata_u32("llama.attention.head_count", 2)
+            .metadata_u32("llama.attention.head_count_kv", 2)
+            .metadata_u32("llama.feed_forward_length", intermediate_size as u32)
+            .metadata_f32("llama.attention.layer_norm_rms_epsilon", 1e-5)
+            .metadata_u32("llama.context_length", max_seq_len as u32);
+
+        let zeros_vocab_hs = vec![0.0f32; 100 * hidden_size];
+        let zeros_hshs = vec![0.0f32; hidden_size * hidden_size];
+        let zeros_ishs = vec![0.0f32; intermediate_size * hidden_size];
+        let zeros_hsint = vec![0.0f32; hidden_size * intermediate_size];
+        let ones_hs = vec![1.0f32; hidden_size];
+
+        builder
+            .tensor_f32("token_embd.weight", &[100, hidden_size as u64], &zeros_vocab_hs)
+            .tensor_f32("output_norm.weight", &[hidden_size as u64], &ones_hs)
+            .tensor_f32("output.weight", &[100, hidden_size as u64], &zeros_vocab_hs)
+            .tensor_f32("blk.0.attn_norm.weight", &[hidden_size as u64], &ones_hs)
+            .tensor_f32("blk.0.attn_q.weight", &[hidden_size as u64, hidden_size as u64], &zeros_hshs)
+            .tensor_f32("blk.0.attn_k.weight", &[hidden_size as u64, hidden_size as u64], &zeros_hshs)
+            .tensor_f32("blk.0.attn_v.weight", &[hidden_size as u64, hidden_size as u64], &zeros_hshs)
+            .tensor_f32("blk.0.attn_output.weight", &[hidden_size as u64, hidden_size as u64], &zeros_hshs)
+            .tensor_f32("blk.0.ffn_norm.weight", &[hidden_size as u64], &ones_hs)
+            .tensor_f32("blk.0.ffn_gate.weight", &[intermediate_size as u64, hidden_size as u64], &zeros_ishs)
+            .tensor_f32("blk.0.ffn_up.weight", &[intermediate_size as u64, hidden_size as u64], &zeros_ishs)
+            .tensor_f32("blk.0.ffn_down.weight", &[hidden_size as u64, intermediate_size as u64], &zeros_hsint);
+
+        builder.write(&tmp);
+
+        let model = Model::open(&tmp).unwrap();
+        let mut kv_cache = KvCache::new(n_layers, max_seq_len, &model.config);
+        let mut buf = DecodeBuffers::new(max_seq_len, &model.config);
+
+        let generated = model.generate(&[0, 1, 2], 5, &mut kv_cache, &mut buf).unwrap();
+        assert_eq!(generated.len(), 5);
+        assert!(generated.iter().all(|&t| t < 100));
+        assert_eq!(kv_cache.len(), 3 + 5);
 
         fs::remove_file(&tmp).unwrap();
     }
