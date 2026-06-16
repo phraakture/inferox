@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 byteorder = "1.5"
+half = "2.4"
 memmap2 = "0.9"

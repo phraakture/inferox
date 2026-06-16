@@ -5,6 +5,7 @@
 //! into memory; instead it exposes offsets and layouts so callers can mmap or
 //! stream weights as needed.
 
+mod dequant;
 mod error;
 mod file;
 mod tensor;
@@ -12,6 +13,7 @@ mod types;
 mod value;
 mod weights;
 
+pub use dequant::{dequantize_f32, dequantize_to_vec};
 pub use error::{Error, Result};
 pub use file::{GgufFile, Header, Metadata};
 pub use tensor::TensorInfo;

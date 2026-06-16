@@ -48,6 +48,18 @@ impl Weights {
         self.tensor_bytes(info)
     }
 
+    /// Dequantize the tensor with the given name to a `Vec<f32>`.
+    ///
+    /// Supported types: F32, F16, Q4_0, Q8_0.
+    pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>> {
+        let info = self
+            .file
+            .tensor(name)
+            .ok_or_else(|| Error::TensorNotFound(name.to_string()))?;
+        let bytes = self.tensor_bytes(info)?;
+        crate::gguf::dequant::dequantize_to_vec(info, bytes)
+    }
+
     /// Return the raw bytes for the tensor at the given index in the info table.
     pub fn tensor_by_index(&self, index: usize) -> Result<&[u8]> {
         let info = self
