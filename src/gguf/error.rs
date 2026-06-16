@@ -36,6 +36,9 @@ pub enum Error {
 
     /// A tensor's byte range overflows the available address space or file bounds.
     TensorOffsetOverflow,
+
+    /// The model architecture in the GGUF file is not supported.
+    UnsupportedArchitecture(String),
 }
 
 impl fmt::Display for Error {
@@ -60,6 +63,9 @@ impl fmt::Display for Error {
                 write!(f, "tensor index out of bounds: {index}")
             }
             Error::TensorOffsetOverflow => write!(f, "tensor byte range overflows file bounds"),
+            Error::UnsupportedArchitecture(arch) => {
+                write!(f, "unsupported model architecture: {arch}")
+            }
         }
     }
 }

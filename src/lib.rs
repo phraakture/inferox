@@ -4,4 +4,5 @@
 //! Model execution layers will be added incrementally.
 
 pub mod gguf;
+pub mod model;
 pub mod ops;

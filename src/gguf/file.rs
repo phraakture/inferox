@@ -125,11 +125,71 @@ impl GgufFile {
         self.tensors.iter().find(|t| t.name == name)
     }
 
+    /// Find the index of a tensor by name.
+    pub fn tensor_index(&self, name: &str) -> Option<usize> {
+        self.tensors.iter().position(|t| t.name == name)
+    }
+
     /// Total byte size of all tensor weight data, if every type is known.
     pub fn total_tensor_data_size(&self) -> Option<u64> {
         self.tensors
             .iter()
             .map(|t| t.byte_size().map(|s| s as u64))
             .sum()
+    }
+
+    /// Get a metadata value as `u32`.
+    pub fn get_u32(&self, key: &str) -> Option<u32> {
+        match self.get(key)? {
+            crate::gguf::value::Value::Uint8(v) => Some(*v as u32),
+            crate::gguf::value::Value::Int8(v) => Some(*v as u32),
+            crate::gguf::value::Value::Uint16(v) => Some(*v as u32),
+            crate::gguf::value::Value::Int16(v) => Some(*v as u32),
+            crate::gguf::value::Value::Uint32(v) => Some(*v),
+            crate::gguf::value::Value::Int32(v) => Some(*v as u32),
+            crate::gguf::value::Value::Uint64(v) => Some(*v as u32),
+            crate::gguf::value::Value::Int64(v) => Some(*v as u32),
+            _ => None,
+        }
+    }
+
+    /// Get a metadata value as `u64`.
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        match self.get(key)? {
+            crate::gguf::value::Value::Uint8(v) => Some(*v as u64),
+            crate::gguf::value::Value::Int8(v) => Some(*v as u64),
+            crate::gguf::value::Value::Uint16(v) => Some(*v as u64),
+            crate::gguf::value::Value::Int16(v) => Some(*v as u64),
+            crate::gguf::value::Value::Uint32(v) => Some(*v as u64),
+            crate::gguf::value::Value::Int32(v) => Some(*v as u64),
+            crate::gguf::value::Value::Uint64(v) => Some(*v),
+            crate::gguf::value::Value::Int64(v) => Some(*v as u64),
+            _ => None,
+        }
+    }
+
+    /// Get a metadata value as `f32`.
+    pub fn get_f32(&self, key: &str) -> Option<f32> {
+        match self.get(key)? {
+            crate::gguf::value::Value::Float32(v) => Some(*v),
+            crate::gguf::value::Value::Float64(v) => Some(*v as f32),
+            crate::gguf::value::Value::Uint8(v) => Some(*v as f32),
+            crate::gguf::value::Value::Int8(v) => Some(*v as f32),
+            crate::gguf::value::Value::Uint16(v) => Some(*v as f32),
+            crate::gguf::value::Value::Int16(v) => Some(*v as f32),
+            crate::gguf::value::Value::Uint32(v) => Some(*v as f32),
+            crate::gguf::value::Value::Int32(v) => Some(*v as f32),
+            crate::gguf::value::Value::Uint64(v) => Some(*v as f32),
+            crate::gguf::value::Value::Int64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    /// Get a metadata value as a string slice.
+    pub fn get_string(&self, key: &str) -> Option<&str> {
+        match self.get(key)? {
+            crate::gguf::value::Value::String(s) => Some(s.as_str()),
+            _ => None,
+        }
     }
 }
