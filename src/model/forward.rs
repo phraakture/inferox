@@ -2,7 +2,9 @@
 
 use crate::gguf::Result;
 use crate::model::{Config, Layer, Model};
-use crate::ops::{add_in_place, matmul_t, rms_norm, rope, softmax_rows, swiglu};
+use crate::ops::{
+    add_in_place, embedding_lookup, matmul_t, rms_norm, rope, softmax_rows, swiglu,
+};
 
 /// Reusable scratch buffers for a single layer forward pass.
 #[derive(Debug)]
@@ -204,6 +206,56 @@ impl Layer {
     }
 }
 
+impl Model {
+    /// Run a full forward pass on a prompt and return logits for every token.
+    ///
+    /// Output shape: `[input_ids.len(), vocab_size]`. For generation you
+    /// typically only need the last row.
+    pub fn forward(&self, input_ids: &[u32]) -> Result<Vec<f32>> {
+        let seq_len = input_ids.len();
+        let vocab_size = self.config.vocab_size as usize;
+        let hidden_size = self.config.hidden_size;
+
+        if input_ids.iter().any(|&id| id as usize >= vocab_size) {
+            return Err(crate::gguf::Error::InvalidTensorIndex(0));
+        }
+
+        let embeddings = self.weights.tensor_f32_by_index(self.token_embeddings)?;
+        let mut hidden = vec![0.0f32; seq_len * hidden_size];
+        embedding_lookup(&embeddings, input_ids, hidden_size, &mut hidden);
+
+        let mut buf = LayerBuffers::new(seq_len, &self.config);
+        for layer in &self.layers {
+            layer.forward(self, &mut hidden, &mut buf)?;
+        }
+
+        let output_norm = self.weights.tensor_f32_by_index(self.output_norm)?;
+        rms_norm(&mut hidden, &output_norm, self.config.norm_eps);
+
+        let mut logits = vec![0.0f32; seq_len * vocab_size];
+        let output_idx = self.output.unwrap_or(self.token_embeddings);
+        let output_weight = self.weights.tensor_f32_by_index(output_idx)?;
+        matmul_t(
+            &hidden,
+            &output_weight,
+            &mut logits,
+            seq_len,
+            vocab_size,
+            hidden_size,
+        );
+
+        Ok(logits)
+    }
+
+    /// Convenience: forward a prompt and return logits for the last token only.
+    pub fn forward_last_token_logits(&self, input_ids: &[u32]) -> Result<Vec<f32>> {
+        let vocab_size = self.config.vocab_size as usize;
+        let all_logits = self.forward(input_ids)?;
+        let start = all_logits.len() - vocab_size;
+        Ok(all_logits[start..].to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,15 +383,15 @@ mod tests {
 
         // One layer of weights
         let ones_hs = vec![1.0f32; hidden_size];
-        let zeros_hs = vec![0.0f32; hidden_size];
+        let zeros_vocab_hs = vec![0.0f32; 100 * hidden_size];
         let ones_hshs = vec![1.0f32; hidden_size * hidden_size];
         let ones_ishs = vec![1.0f32; intermediate_size * hidden_size];
         let ones_hsint = vec![1.0f32; hidden_size * intermediate_size];
 
         builder
-            .tensor_f32("token_embd.weight", &[1, hidden_size as u64], &zeros_hs)
+            .tensor_f32("token_embd.weight", &[100, hidden_size as u64], &zeros_vocab_hs)
             .tensor_f32("output_norm.weight", &[hidden_size as u64], &ones_hs)
-            .tensor_f32("output.weight", &[1, hidden_size as u64], &zeros_hs)
+            .tensor_f32("output.weight", &[100, hidden_size as u64], &zeros_vocab_hs)
             .tensor_f32("blk.0.attn_norm.weight", &[hidden_size as u64], &ones_hs)
             .tensor_f32("blk.0.attn_q.weight", &[hidden_size as u64, hidden_size as u64], &ones_hshs)
             .tensor_f32("blk.0.attn_k.weight", &[hidden_size as u64, hidden_size as u64], &ones_hshs)
@@ -359,6 +411,9 @@ mod tests {
         model.layers[0].forward(&model, &mut x, &mut buf).unwrap();
 
         assert_eq!(x.len(), hidden_size);
+
+        let logits = model.forward(&[0]).unwrap();
+        assert_eq!(logits.len(), 100); // vocab_size
 
         fs::remove_file(&tmp).unwrap();
     }

@@ -11,7 +11,7 @@ Rust-native LLM runtime prototype. Goal: load a GGUF model and generate text end
 - [x] parse llama architecture metadata
 - [x] wire embeddings / layers / output tensors
 - [x] single transformer layer forward pass
-- [ ] full model forward: embed -> layers -> norm -> logits
+- [x] full model forward: embed -> layers -> norm -> logits
 - [ ] KV-cache for autoregressive generation
 - [ ] tokenizer (BPE / SentencePiece)
 - [ ] sampler (greedy / top-k / top-p)

@@ -132,6 +132,25 @@ pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
     }
 }
 
+/// Gather token embeddings by integer token ids.
+///
+/// `embeddings` is `[vocab_size, hidden_size]` in row-major order. For each
+/// token id in `input_ids`, the corresponding row is copied into `out`, which
+/// has shape `[input_ids.len(), hidden_size]`.
+pub fn embedding_lookup(embeddings: &[f32], input_ids: &[u32], hidden_size: usize, out: &mut [f32]) {
+    assert_eq!(out.len(), input_ids.len() * hidden_size, "embedding output shape mismatch");
+
+    for (pos, &id) in input_ids.iter().enumerate() {
+        let src = id as usize * hidden_size;
+        let dst = pos * hidden_size;
+        assert!(
+            src + hidden_size <= embeddings.len(),
+            "token id {id} out of vocabulary bounds"
+        );
+        out[dst..dst + hidden_size].copy_from_slice(&embeddings[src..src + hidden_size]);
+    }
+}
+
 /// Apply Rotary Position Embeddings (RoPE) in-place.
 ///
 /// `x` is `[seq_len, n_heads, head_dim]` in row-major order. The rotation is
