@@ -27,6 +27,15 @@ pub enum Error {
 
     /// The file ended before the parser could read the requested data.
     UnexpectedEof,
+
+    /// A requested tensor name was not found in the tensor info table.
+    TensorNotFound(String),
+
+    /// A requested tensor index is outside the tensor info table.
+    InvalidTensorIndex(usize),
+
+    /// A tensor's byte range overflows the available address space or file bounds.
+    TensorOffsetOverflow,
 }
 
 impl fmt::Display for Error {
@@ -46,6 +55,11 @@ impl fmt::Display for Error {
                 write!(f, "tensor shape has invalid number of dimensions: {n_dims}")
             }
             Error::UnexpectedEof => write!(f, "unexpected end of file"),
+            Error::TensorNotFound(name) => write!(f, "tensor not found: {name}"),
+            Error::InvalidTensorIndex(index) => {
+                write!(f, "tensor index out of bounds: {index}")
+            }
+            Error::TensorOffsetOverflow => write!(f, "tensor byte range overflows file bounds"),
         }
     }
 }

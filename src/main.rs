@@ -1,25 +1,27 @@
 use std::env;
 use std::process;
 
-use inferox::gguf::{GgufFile, TensorInfo};
+use inferox::gguf::{GgufFile, TensorInfo, Weights};
 
 fn main() {
     let path = env::args()
         .nth(1)
         .unwrap_or_else(|| "model.gguf".to_string());
 
-    let file = match GgufFile::open(&path) {
-        Ok(f) => f,
+    let weights = match Weights::open(&path) {
+        Ok(w) => w,
         Err(e) => {
-            eprintln!("error: failed to parse '{}': {e}", path);
+            eprintln!("error: failed to open '{}': {e}", path);
             process::exit(1);
         }
     };
 
-    print_header(&file);
-    print_metadata(&file);
-    print_tensors(&file);
-    print_layout(&file, &path);
+    let file = weights.file();
+    print_header(file);
+    print_metadata(file);
+    print_tensors(file);
+    print_layout(file, &path);
+    print_tensor_bytes(&weights, file);
 }
 
 fn print_header(file: &GgufFile) {
@@ -78,6 +80,25 @@ fn print_layout(file: &GgufFile, path: &str) {
     match file.total_tensor_data_size() {
         Some(size) => println!("  total tensor bytes:   {} bytes", size),
         None => println!("  total tensor bytes:   <unknown>"),
+    }
+}
+
+fn print_tensor_bytes(weights: &Weights, file: &GgufFile) {
+    section("Raw tensor bytes (mmap)");
+    if file.tensors.is_empty() {
+        println!("  (no tensors)");
+        return;
+    }
+
+    for (name, bytes) in weights.tensors().take(5) {
+        match bytes {
+            Ok(b) => println!("  {:40} -> {} bytes", name, b.len()),
+            Err(e) => println!("  {:40} -> error: {e}", name),
+        }
+    }
+    let remaining = file.tensors.len().saturating_sub(5);
+    if remaining > 0 {
+        println!("  ... and {remaining} more tensor(s)");
     }
 }
 
