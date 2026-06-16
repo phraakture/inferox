@@ -6,4 +6,5 @@
 pub mod gguf;
 pub mod model;
 pub mod ops;
+pub mod sampler;
 pub mod tokenizer;

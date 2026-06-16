@@ -14,6 +14,6 @@ Rust-native LLM runtime prototype. Goal: load a GGUF model and generate text end
 - [x] full model forward: embed -> layers -> norm -> logits
 - [x] KV-cache for autoregressive generation
 - [x] tokenizer (BPE / SentencePiece)
-- [ ] sampler (greedy / top-k / top-p)
-- [ ] CLI: prompt in, text out
+- [x] sampler with temperature / top-k / top-p
+- [x] CLI: prompt in, text out
 - [ ] more quant types: Q5_0, Q8_K, IQ quants
