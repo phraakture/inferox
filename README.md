@@ -13,7 +13,7 @@ Rust-native LLM runtime prototype. Goal: load a GGUF model and generate text end
 - [x] single transformer layer forward pass
 - [x] full model forward: embed -> layers -> norm -> logits
 - [x] KV-cache for autoregressive generation
-- [ ] tokenizer (BPE / SentencePiece)
+- [x] tokenizer (BPE / SentencePiece)
 - [ ] sampler (greedy / top-k / top-p)
 - [ ] CLI: prompt in, text out
 - [ ] more quant types: Q5_0, Q8_K, IQ quants
