@@ -17,6 +17,6 @@ Rust-native LLM runtime prototype. Goal: load a GGUF model and generate text end
 - [x] sampler with temperature / top-k / top-p
 - [x] CLI: prompt in, text out
 - [ ] dequantize Q4_K_M, Q6_K, Q8_K (most HF models)
-- [ ] AVX2 SIMD matmul
+- [x] AVX2 SIMD matmul
 - [ ] benchmark tokens/sec vs llama.cpp
 - [ ] batched prefill optimization

@@ -1,8 +1,8 @@
 //! CPU compute kernels for inference.
 //!
-//! These are deliberately simple, correct reference implementations. They
-//! operate on contiguous `f32` buffers and can be replaced with SIMD/BLAS
-//! kernels later without changing call sites.
+//! These operate on contiguous `f32` buffers. `matmul` and `matmul_t` dispatch
+//! to AVX2+FMA kernels on x86_64 when available, falling back to scalar
+//! reference implementations otherwise.
 
 use std::f32;
 
@@ -12,13 +12,38 @@ use std::f32;
 /// - `A` has shape `[m, k]`
 /// - `B` has shape `[k, n]`
 /// - `C` has shape `[m, n]`
-///
-/// This is a naive triple-loop implementation. It is correct but not tuned.
 pub fn matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     assert_eq!(a.len(), m * k, "A shape mismatch");
     assert_eq!(b.len(), k * n, "B shape mismatch");
     assert_eq!(c.len(), m * n, "C shape mismatch");
 
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return unsafe { matmul_avx2(a, b, c, m, n, k) };
+    }
+
+    matmul_scalar(a, b, c, m, n, k);
+}
+
+/// Matrix multiply with a transposed `B`: `C = A @ B.T`.
+///
+/// - `A` has shape `[m, k]`
+/// - `B` has shape `[n, k]` (stored row-major, interpreted as transposed)
+/// - `C` has shape `[m, n]`
+pub fn matmul_t(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    assert_eq!(a.len(), m * k, "A shape mismatch");
+    assert_eq!(b.len(), n * k, "B shape mismatch");
+    assert_eq!(c.len(), m * n, "C shape mismatch");
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return unsafe { matmul_t_avx2(a, b, c, m, n, k) };
+    }
+
+    matmul_t_scalar(a, b, c, m, n, k);
+}
+
+fn matmul_scalar(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     c.fill(0.0);
 
     for i in 0..m {
@@ -33,19 +58,7 @@ pub fn matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize)
     }
 }
 
-/// Matrix multiply with a transposed `B`: `C = A @ B.T`.
-///
-/// - `A` has shape `[m, k]`
-/// - `B` has shape `[n, k]` (stored row-major, interpreted as transposed)
-/// - `C` has shape `[m, n]`
-///
-/// This is common in transformer linear layers where weights are often stored
-/// with the output dimension first.
-pub fn matmul_t(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
-    assert_eq!(a.len(), m * k, "A shape mismatch");
-    assert_eq!(b.len(), n * k, "B shape mismatch");
-    assert_eq!(c.len(), m * n, "C shape mismatch");
-
+fn matmul_t_scalar(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     for i in 0..m {
         for j in 0..n {
             let mut sum = 0.0f32;
@@ -55,6 +68,84 @@ pub fn matmul_t(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usiz
             c[i * n + j] = sum;
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn matmul_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    use std::arch::x86_64::*;
+
+    c.fill(0.0);
+
+    for i in 0..m {
+        for l in 0..k {
+            let a_val = _mm256_set1_ps(a[i * k + l]);
+            let b_row = &b[l * n..(l + 1) * n];
+            let c_row = &mut c[i * n..(i + 1) * n];
+
+            let mut j = 0;
+            while j + 8 <= n {
+                unsafe {
+                    let b_vec = _mm256_loadu_ps(b_row.as_ptr().add(j));
+                    let c_vec = _mm256_loadu_ps(c_row.as_ptr().add(j));
+                    let prod = _mm256_fmadd_ps(a_val, b_vec, c_vec);
+                    _mm256_storeu_ps(c_row.as_mut_ptr().add(j), prod);
+                }
+                j += 8;
+            }
+            while j < n {
+                c_row[j] += a[i * k + l] * b_row[j];
+                j += 1;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn matmul_t_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    use std::arch::x86_64::*;
+
+    for i in 0..m {
+        let a_row = &a[i * k..(i + 1) * k];
+        for j in 0..n {
+            let b_row = &b[j * k..(j + 1) * k];
+
+            let mut sum_vec = _mm256_setzero_ps();
+            let mut l = 0;
+            while l + 8 <= k {
+                unsafe {
+                    let a_vec = _mm256_loadu_ps(a_row.as_ptr().add(l));
+                    let b_vec = _mm256_loadu_ps(b_row.as_ptr().add(l));
+                    sum_vec = _mm256_fmadd_ps(a_vec, b_vec, sum_vec);
+                }
+                l += 8;
+            }
+
+            let mut sum = unsafe { hsum256_ps(sum_vec) };
+            while l < k {
+                sum += a_row[l] * b_row[l];
+                l += 1;
+            }
+
+            c[i * n + j] = sum;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+
+    let lo = _mm256_castps256_ps128(v);
+    let hi = _mm256_extractf128_ps(v, 1);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    let sums2 = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(sums2)
 }
 
 /// In-place RMSNorm: `x = x / sqrt(mean(x^2) + eps) * weight`.
@@ -218,6 +309,25 @@ mod tests {
         matmul_t(&a, &b, &mut c, 2, 2, 2);
 
         assert_eq!(c, vec![2.0, 8.0, 4.0, 18.0]);
+    }
+
+    #[test]
+    fn matmul_with_non_multiple_of_eight() {
+        // exercises the scalar tail path even on AVX2 machines
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![1.0, 0.0, 2.0, 1.0, 0.0, 2.0]; // 3x2 row-major
+        let mut c = vec![0.0; 2];
+        matmul(&a, &b, &mut c, 1, 2, 3);
+        assert_eq!(c, vec![5.0, 8.0]);
+    }
+
+    #[test]
+    fn matmul_t_with_non_multiple_of_eight() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![1.0, 0.0, 2.0, 2.0, 1.0, 0.0]; // 2x3 stored row-major
+        let mut c = vec![0.0; 2];
+        matmul_t(&a, &b, &mut c, 1, 2, 3);
+        assert_eq!(c, vec![7.0, 4.0]);
     }
 
     #[test]
