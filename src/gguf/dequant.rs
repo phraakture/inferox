@@ -6,7 +6,7 @@ use half::f16;
 /// Dequantize a tensor's raw bytes into a caller-provided `f32` buffer.
 ///
 /// The output length must equal the tensor's element count.
-/// Supported types: F32, F16, Q4_0, Q8_0.
+/// Supported types: F32, F16, Q4_0, Q8_0, Q4_K.
 pub fn dequantize_f32(info: &TensorInfo, bytes: &[u8], out: &mut [f32]) -> Result<()> {
     let expected = info
         .byte_size()
@@ -23,6 +23,7 @@ pub fn dequantize_f32(info: &TensorInfo, bytes: &[u8], out: &mut [f32]) -> Resul
         TensorType::F16 => dequantize_f16_f32(bytes, out),
         TensorType::Q4_0 => dequantize_q4_0(bytes, out),
         TensorType::Q8_0 => dequantize_q8_0(bytes, out),
+        TensorType::Q4K => dequantize_q4_k(bytes, out),
         _ => Err(Error::UnknownTensorType(info.ty as u32)),
     }
 }
@@ -107,6 +108,58 @@ fn dequantize_q8_0(bytes: &[u8], out: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+/// GGML Q4_K: 256 elements per block, 144 bytes per block.
+///
+/// Block layout:
+///   - 2 bytes: global scale `d` as little-endian f16
+///   - 2 bytes: global min `dmin` as little-endian f16
+///   - 12 bytes: packed 6-bit scales and mins for 8 groups of 32 weights
+///   - 128 bytes: 256 nibbles of quantized weights
+///
+/// Each group `j` has a 6-bit scale `sc` and 6-bit min `mn`. For weights in
+/// that group, `y = d * sc * q - dmin * mn` where `q` is a nibble in 0..15.
+fn dequantize_q4_k(bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    const BLOCK_ELEMS: usize = 256;
+    const BLOCK_BYTES: usize = 144;
+    const GROUP_ELEMS: usize = 32;
+    const N_GROUPS: usize = BLOCK_ELEMS / GROUP_ELEMS;
+
+    if !bytes.len().is_multiple_of(BLOCK_BYTES) {
+        return Err(Error::UnexpectedEof);
+    }
+
+    for (block, chunk) in bytes.chunks_exact(BLOCK_BYTES).enumerate() {
+        let d = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+        let dmin = f16::from_le_bytes([chunk[2], chunk[3]]).to_f32();
+        let scales = &chunk[4..16];
+        let qs = &chunk[16..];
+        let base = block * BLOCK_ELEMS;
+
+        for group in 0..N_GROUPS {
+            let (sc, mn) = if group < 4 {
+                let sc = (scales[group] & 0x3F) as f32;
+                let mn = (scales[group + 4] & 0x3F) as f32;
+                (sc, mn)
+            } else {
+                let sc = ((scales[group + 4] & 0x0F) as u32 | ((scales[group - 4] as u32 >> 6) << 4)) as f32;
+                let mn = ((scales[group + 4] as u32 >> 4) | ((scales[group] as u32 >> 6) << 4)) as f32;
+                (sc, mn)
+            };
+
+            let dall = d * sc;
+            let dmin_val = dmin * mn;
+            let qs_offset = group * (GROUP_ELEMS / 2);
+
+            for l in 0..GROUP_ELEMS {
+                let byte = qs[qs_offset + l / 2];
+                let q = if l % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                out[base + group * GROUP_ELEMS + l] = dall * q as f32 - dmin_val;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +235,34 @@ mod tests {
         let info = tensor_info(TensorType::F32, &[3], 3);
         let out = dequantize_to_vec(&info, &bytes).unwrap();
         assert_eq!(out, vec![1.0, 2.0, -3.0]);
+    }
+
+    #[test]
+    fn dequantize_q4_k_single_block() {
+        let mut block = Vec::with_capacity(144);
+        // d = 1.0, dmin = 0.0
+        block.extend_from_slice(&f16::from_f32(1.0).to_le_bytes());
+        block.extend_from_slice(&f16::from_f32(0.0).to_le_bytes());
+        // scales: groups 0-3 sc=1/mn=0, groups 4-7 sc=1/mn=0
+        block.extend_from_slice(&[1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1]);
+        // qs: 128 bytes of nibbles 0,1,2,...,31 mod 16 repeating per group
+        for _ in 0..8 {
+            for pair in 0..16_u8 {
+                let low = 2 * pair;
+                let high = (2 * pair + 1) % 32;
+                let byte = (high << 4) | low;
+                block.push(byte);
+            }
+        }
+
+        let info = tensor_info(TensorType::Q4K, &[256], 256);
+        let out = dequantize_to_vec(&info, &block).unwrap();
+
+        assert_eq!(out.len(), 256);
+        for (j, v) in out.iter().enumerate() {
+            let expected = ((j % 32) % 16) as f32;
+            assert!((v - expected).abs() < 1e-6, "j={j}: got {v}, expected {expected}");
+        }
     }
 
     #[test]
