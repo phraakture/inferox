@@ -4,7 +4,7 @@ use crate::gguf::Result;
 use crate::model::{Config, Layer, Model};
 use crate::model::cache::{DecodeBuffers, KvCache};
 use crate::ops::{
-    add_in_place, embedding_lookup, matmul_t, rms_norm, rope, softmax_rows, swiglu,
+    add_in_place, embedding_lookup, matmul_t, rms_norm, rms_norm_rows, rope, softmax_rows, swiglu,
 };
 
 /// Reusable scratch buffers for a single layer forward pass.
@@ -68,7 +68,7 @@ impl Layer {
         buf.residual.copy_from_slice(x);
 
         let attn_norm = model.weights.tensor_f32_by_index(self.attn_norm)?;
-        rms_norm(x, &attn_norm, cfg.norm_eps);
+        rms_norm_rows(x, &attn_norm, cfg.norm_eps, seq_len);
 
         let w_q = model.weights.tensor_f32_by_index(self.attn_q)?;
         let w_k = model.weights.tensor_f32_by_index(self.attn_k)?;
@@ -168,7 +168,7 @@ impl Layer {
         buf.residual.copy_from_slice(x);
 
         let ffn_norm = model.weights.tensor_f32_by_index(self.ffn_norm)?;
-        rms_norm(x, &ffn_norm, cfg.norm_eps);
+        rms_norm_rows(x, &ffn_norm, cfg.norm_eps, seq_len);
 
         let w_gate = model.weights.tensor_f32_by_index(self.ffn_gate)?;
         let w_up = model.weights.tensor_f32_by_index(self.ffn_up)?;
@@ -202,6 +202,136 @@ impl Layer {
 
         x.copy_from_slice(&buf.ffn_down);
         add_in_place(x, &buf.residual);
+
+        Ok(())
+    }
+
+    /// Batched prefill: process `seq_len` prompt tokens and write K/V to cache.
+    ///
+    /// `x` has shape `[seq_len, hidden_size]`. Causal masking is applied so
+    /// position `pos` only attends to positions `0..=pos`. The computed keys
+    /// and values are written into `kv_cache`/`v_cache` starting at
+    /// `cache_start`.
+    pub fn prefill(
+        &self,
+        model: &Model,
+        x: &mut [f32],
+        kv_cache: &mut [f32],
+        v_cache: &mut [f32],
+        cache_start: usize,
+        buf: &mut LayerBuffers,
+    ) -> Result<()> {
+        let cfg = &model.config;
+        let seq_len = x.len() / cfg.hidden_size;
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        let kv_group_size = cfg.n_heads / cfg.n_kv_heads;
+
+        // --- Attention branch ---
+        buf.residual[..x.len()].copy_from_slice(x);
+
+        let attn_norm = model.weights.tensor_f32_by_index(self.attn_norm)?;
+        rms_norm_rows(x, &attn_norm, cfg.norm_eps, seq_len);
+
+        let w_q = model.weights.tensor_f32_by_index(self.attn_q)?;
+        let w_k = model.weights.tensor_f32_by_index(self.attn_k)?;
+        let w_v = model.weights.tensor_f32_by_index(self.attn_v)?;
+
+        matmul_t(x, &w_q, &mut buf.q, seq_len, cfg.hidden_size, cfg.hidden_size);
+        matmul_t(x, &w_k, &mut buf.k, seq_len, kv_dim, cfg.hidden_size);
+        matmul_t(x, &w_v, &mut buf.v, seq_len, kv_dim, cfg.hidden_size);
+
+        rope(&mut buf.q, seq_len, cfg.n_heads, cfg.head_dim, cfg.rope_dim, cfg.rope_base);
+        rope(&mut buf.k, seq_len, cfg.n_kv_heads, cfg.head_dim, cfg.rope_dim, cfg.rope_base);
+
+        // Write K/V into the cache
+        for t in 0..seq_len {
+            let src_k = t * kv_dim;
+            let src_v = t * kv_dim;
+            let dst = (cache_start + t) * kv_dim;
+            kv_cache[dst..dst + kv_dim].copy_from_slice(&buf.k[src_k..src_k + kv_dim]);
+            v_cache[dst..dst + kv_dim].copy_from_slice(&buf.v[src_v..src_v + kv_dim]);
+        }
+
+        // Causal multi-head attention (with GQA support)
+        buf.attn_out.fill(0.0);
+
+        for h_q in 0..cfg.n_heads {
+            let h_kv = h_q / kv_group_size;
+
+            for pos in 0..seq_len {
+                let q_offset = (pos * cfg.n_heads + h_q) * cfg.head_dim;
+                let q_head = &buf.q[q_offset..q_offset + cfg.head_dim];
+
+                for t in 0..seq_len {
+                    let cache_pos = cache_start + t;
+                    if cache_pos > cache_start + pos {
+                        // Causal mask: future tokens get -inf
+                        buf.scores[pos * seq_len + t] = f32::NEG_INFINITY;
+                        continue;
+                    }
+
+                    let k_offset = (t * cfg.n_kv_heads + h_kv) * cfg.head_dim;
+                    let k_head = &buf.k[k_offset..k_offset + cfg.head_dim];
+
+                    let mut score = 0.0f32;
+                    for d in 0..cfg.head_dim {
+                        score += q_head[d] * k_head[d];
+                    }
+                    buf.scores[pos * seq_len + t] = score / (cfg.head_dim as f32).sqrt();
+                }
+            }
+
+            softmax_rows(&mut buf.scores, seq_len, seq_len);
+
+            for pos in 0..seq_len {
+                let out_offset = pos * cfg.head_dim;
+                buf.head_out[out_offset..out_offset + cfg.head_dim].fill(0.0);
+
+                for t in 0..=pos {
+                    let score = buf.scores[pos * seq_len + t];
+                    let v_offset = (t * cfg.n_kv_heads + h_kv) * cfg.head_dim;
+                    let v_head = &buf.v[v_offset..v_offset + cfg.head_dim];
+
+                    for (d, v_val) in v_head.iter().enumerate().take(cfg.head_dim) {
+                        buf.head_out[out_offset + d] += score * v_val;
+                    }
+                }
+
+                let attn_offset = pos * cfg.hidden_size + h_q * cfg.head_dim;
+                buf.attn_out[attn_offset..attn_offset + cfg.head_dim]
+                    .copy_from_slice(&buf.head_out[out_offset..out_offset + cfg.head_dim]);
+            }
+        }
+
+        // Output projection
+        let w_o = model.weights.tensor_f32_by_index(self.attn_output)?;
+        matmul_t(&buf.attn_out, &w_o, x, seq_len, cfg.hidden_size, cfg.hidden_size);
+        add_in_place(x, &buf.residual[..x.len()]);
+
+        // --- FFN branch ---
+        buf.residual[..x.len()].copy_from_slice(x);
+
+        let ffn_norm = model.weights.tensor_f32_by_index(self.ffn_norm)?;
+        rms_norm_rows(x, &ffn_norm, cfg.norm_eps, seq_len);
+
+        let w_gate = model.weights.tensor_f32_by_index(self.ffn_gate)?;
+        let w_up = model.weights.tensor_f32_by_index(self.ffn_up)?;
+        let w_down = model.weights.tensor_f32_by_index(self.ffn_down)?;
+
+        matmul_t(x, &w_gate, &mut buf.ffn_gate, seq_len, cfg.intermediate_size, cfg.hidden_size);
+        matmul_t(x, &w_up, &mut buf.ffn_up, seq_len, cfg.intermediate_size, cfg.hidden_size);
+        swiglu(&buf.ffn_gate, &buf.ffn_up, &mut buf.ffn_mid);
+        matmul_t(
+            &buf.ffn_mid,
+            &w_down,
+            &mut buf.ffn_down,
+            seq_len,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+        );
+
+        x.copy_from_slice(&buf.ffn_down[..x.len()]);
+        add_in_place(x, &buf.residual[..x.len()]);
 
         Ok(())
     }
@@ -334,7 +464,7 @@ impl Model {
         }
 
         let output_norm = self.weights.tensor_f32_by_index(self.output_norm)?;
-        rms_norm(&mut hidden, &output_norm, self.config.norm_eps);
+        rms_norm_rows(&mut hidden, &output_norm, self.config.norm_eps, seq_len);
 
         let mut logits = vec![0.0f32; seq_len * vocab_size];
         let output_idx = self.output.unwrap_or(self.token_embeddings);
@@ -357,6 +487,54 @@ impl Model {
         let all_logits = self.forward(input_ids)?;
         let start = all_logits.len() - vocab_size;
         Ok(all_logits[start..].to_vec())
+    }
+
+    /// Batched prefill: process the full prompt, fill KV-cache, return logits.
+    ///
+    /// Output shape: `[input_ids.len(), vocab_size]`. For generation you
+    /// typically only need the last row.
+    pub fn prefill(&self, input_ids: &[u32], kv_cache: &mut KvCache) -> Result<Vec<f32>> {
+        let seq_len = input_ids.len();
+        let vocab_size = self.config.vocab_size as usize;
+        let hidden_size = self.config.hidden_size;
+
+        if input_ids.iter().any(|&id| id as usize >= vocab_size) {
+            return Err(crate::gguf::Error::InvalidTensorIndex(0));
+        }
+
+        let embeddings = self.weights.tensor_f32_by_index(self.token_embeddings)?;
+        let mut hidden = vec![0.0f32; seq_len * hidden_size];
+        embedding_lookup(&embeddings, input_ids, hidden_size, &mut hidden);
+
+        let mut buf = LayerBuffers::new(seq_len, &self.config);
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            layer.prefill(
+                self,
+                &mut hidden,
+                &mut kv_cache.k[layer_idx],
+                &mut kv_cache.v[layer_idx],
+                kv_cache.len,
+                &mut buf,
+            )?;
+        }
+        kv_cache.len += seq_len;
+
+        let output_norm = self.weights.tensor_f32_by_index(self.output_norm)?;
+        rms_norm_rows(&mut hidden, &output_norm, self.config.norm_eps, seq_len);
+
+        let mut logits = vec![0.0f32; seq_len * vocab_size];
+        let output_idx = self.output.unwrap_or(self.token_embeddings);
+        let output_weight = self.weights.tensor_f32_by_index(output_idx)?;
+        matmul_t(
+            &hidden,
+            &output_weight,
+            &mut logits,
+            seq_len,
+            vocab_size,
+            hidden_size,
+        );
+
+        Ok(logits)
     }
 
     /// Run one autoregressive decode step for a single token id.
@@ -409,8 +587,8 @@ impl Model {
 
     /// Greedy autoregressive generation from a prompt.
     ///
-    /// Returns the generated token ids. `kv_cache` and `buf` must be sized for
-    /// the model and a large enough context length.
+    /// Uses batched prefill for the prompt and decode steps for new tokens.
+    /// Returns the generated token ids.
     pub fn generate(
         &self,
         prompt_tokens: &[u32],
@@ -421,14 +599,13 @@ impl Model {
         let mut generated = Vec::new();
         kv_cache.clear();
 
-        for &token in prompt_tokens {
-            self.decode_step(token, kv_cache, buf)?;
-        }
+        let vocab_size = self.config.vocab_size as usize;
+        let mut logits = self.prefill(prompt_tokens, kv_cache)?;
 
         for _ in 0..max_tokens {
-            let next_token = argmax(&buf.logits);
+            let next_token = argmax(&logits[logits.len() - vocab_size..]);
             generated.push(next_token);
-            self.decode_step(next_token, kv_cache, buf)?;
+            logits = self.decode_step(next_token, kv_cache, buf)?.to_vec();
         }
 
         Ok(generated)

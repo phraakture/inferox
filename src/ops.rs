@@ -149,6 +149,9 @@ unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
 }
 
 /// In-place RMSNorm: `x = x / sqrt(mean(x^2) + eps) * weight`.
+///
+/// `x` and `weight` must have the same length. For batched inputs use
+/// [`rms_norm_rows`].
 pub fn rms_norm(x: &mut [f32], weight: &[f32], eps: f32) {
     assert_eq!(x.len(), weight.len(), "RMSNorm weight length mismatch");
 
@@ -161,6 +164,18 @@ pub fn rms_norm(x: &mut [f32], weight: &[f32], eps: f32) {
 
     for (x_i, w_i) in x.iter_mut().zip(weight) {
         *x_i = *x_i * scale * w_i;
+    }
+}
+
+/// In-place RMSNorm applied independently to each row.
+///
+/// `x` has shape `[rows, weight.len()]`.
+pub fn rms_norm_rows(x: &mut [f32], weight: &[f32], eps: f32, rows: usize) {
+    let hidden_size = weight.len();
+    assert_eq!(x.len(), rows * hidden_size, "RMSNorm rows shape mismatch");
+
+    for row in 0..rows {
+        rms_norm(&mut x[row * hidden_size..(row + 1) * hidden_size], weight, eps);
     }
 }
 
