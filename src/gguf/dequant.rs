@@ -24,6 +24,8 @@ pub fn dequantize_f32(info: &TensorInfo, bytes: &[u8], out: &mut [f32]) -> Resul
         TensorType::Q4_0 => dequantize_q4_0(bytes, out),
         TensorType::Q8_0 => dequantize_q8_0(bytes, out),
         TensorType::Q4K => dequantize_q4_k(bytes, out),
+        TensorType::Q6K => dequantize_q6_k(bytes, out),
+        TensorType::Q8K => dequantize_q8_k(bytes, out),
         _ => Err(Error::UnknownTensorType(info.ty as u32)),
     }
 }
@@ -128,7 +130,7 @@ fn dequantize_q4_k(bytes: &[u8], out: &mut [f32]) -> Result<()> {
         return Err(Error::UnexpectedEof);
     }
 
-    for (block, chunk) in bytes.chunks_exact(BLOCK_BYTES).enumerate() {
+        for (block, chunk) in bytes.chunks_exact(BLOCK_BYTES).enumerate() {
         let d = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
         let dmin = f16::from_le_bytes([chunk[2], chunk[3]]).to_f32();
         let scales = &chunk[4..16];
@@ -155,6 +157,75 @@ fn dequantize_q4_k(bytes: &[u8], out: &mut [f32]) -> Result<()> {
                 let q = if l % 2 == 0 { byte & 0x0F } else { byte >> 4 };
                 out[base + group * GROUP_ELEMS + l] = dall * q as f32 - dmin_val;
             }
+        }
+    }
+    Ok(())
+}
+
+/// GGML Q6_K: 256 elements per block, 210 bytes per block.
+///
+/// Block layout:
+///   - 2 bytes: global scale `d` as little-endian f16
+///   - 16 bytes: int8 group scales (one per 16 weights)
+///   - 128 bytes: lower 4 bits of quantized values (2 weights per byte)
+///   - 64 bytes: upper 2 bits of quantized values (4 weights per byte)
+///
+/// Each 6-bit value `q` represents the signed value `q - 32`.
+fn dequantize_q6_k(bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    const BLOCK_ELEMS: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+
+    if !bytes.len().is_multiple_of(BLOCK_BYTES) {
+        return Err(Error::UnexpectedEof);
+    }
+
+    for (block, chunk) in bytes.chunks_exact(BLOCK_BYTES).enumerate() {
+        let d = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+        let scales = &chunk[2..18];
+        let ql = &chunk[18..146];
+        let qh = &chunk[146..210];
+        let base = block * BLOCK_ELEMS;
+
+        for j in 0..BLOCK_ELEMS {
+            let ql_byte = ql[j / 2];
+            let ql_nibble = if j % 2 == 0 { ql_byte & 0x0F } else { ql_byte >> 4 };
+            let qh_byte = qh[j / 4];
+            let qh_bits = (qh_byte >> (2 * (j % 4))) & 3;
+            let q = ql_nibble | (qh_bits << 4);
+            out[base + j] = d * scales[j / 16] as f32 * (q as i32 - 32) as f32;
+        }
+    }
+    Ok(())
+}
+
+/// GGML Q8_K: 256 elements per block, 292 bytes per block.
+///
+/// Block layout:
+///   - 2 bytes: global scale `d` as little-endian f16
+///   - 2 bytes: global min `dmin` as little-endian f16
+///   - 32 bytes: uint8 group scales (one per 8 weights)
+///   - 256 bytes: signed int8 quantized values
+///
+/// Dequantization: `y[j] = d * scales[j/8] * qs[j] - dmin`.
+fn dequantize_q8_k(bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    const BLOCK_ELEMS: usize = 256;
+    const BLOCK_BYTES: usize = 292;
+
+    if !bytes.len().is_multiple_of(BLOCK_BYTES) {
+        return Err(Error::UnexpectedEof);
+    }
+
+    for (block, chunk) in bytes.chunks_exact(BLOCK_BYTES).enumerate() {
+        let d = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+        let dmin = f16::from_le_bytes([chunk[2], chunk[3]]).to_f32();
+        let scales = &chunk[4..36];
+        let qs = &chunk[36..];
+        let base = block * BLOCK_ELEMS;
+
+        for j in 0..BLOCK_ELEMS {
+            let is = j / 8;
+            let q = qs[j] as i8 as f32;
+            out[base + j] = d * scales[is] as f32 * q - dmin;
         }
     }
     Ok(())
@@ -261,6 +332,51 @@ mod tests {
         assert_eq!(out.len(), 256);
         for (j, v) in out.iter().enumerate() {
             let expected = ((j % 32) % 16) as f32;
+            assert!((v - expected).abs() < 1e-6, "j={j}: got {v}, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn dequantize_q6_k_single_block() {
+        let mut block = Vec::with_capacity(210);
+        // d = 1.0
+        block.extend_from_slice(&f16::from_f32(1.0).to_le_bytes());
+        // 16 scales = 1
+        block.extend_from_slice(&[1i8 as u8; 16]);
+        // ql: 128 bytes, all 0 => lower/upper nibble = 0
+        block.extend_from_slice(&[0u8; 128]);
+        // qh: 64 bytes; each byte packs 4 weights' upper 2 bits.
+        // 0b10101010 puts bits 0b10 at every weight position, giving q = 32.
+        block.extend_from_slice(&[0b10101010u8; 64]);
+
+        let info = tensor_info(TensorType::Q6K, &[256], 256);
+        let out = dequantize_to_vec(&info, &block).unwrap();
+
+        assert_eq!(out.len(), 256);
+        for (j, v) in out.iter().enumerate() {
+            assert!((v - 0.0).abs() < 1e-6, "j={j}: got {v}, expected 0");
+        }
+    }
+
+    #[test]
+    fn dequantize_q8_k_single_block() {
+        let mut block = Vec::with_capacity(292);
+        // d = 1.0, dmin = 0.0
+        block.extend_from_slice(&f16::from_f32(1.0).to_le_bytes());
+        block.extend_from_slice(&f16::from_f32(0.0).to_le_bytes());
+        // 32 scales = 1
+        block.extend_from_slice(&[1u8; 32]);
+        // 256 int8 values: 0, 1, 2, ..., 127, -128, -127, ..., -1
+        for j in 0..256_i16 {
+            block.push(j as i8 as u8);
+        }
+
+        let info = tensor_info(TensorType::Q8K, &[256], 256);
+        let out = dequantize_to_vec(&info, &block).unwrap();
+
+        assert_eq!(out.len(), 256);
+        for (j, v) in out.iter().enumerate() {
+            let expected = (j as i8) as f32;
             assert!((v - expected).abs() < 1e-6, "j={j}: got {v}, expected {expected}");
         }
     }
