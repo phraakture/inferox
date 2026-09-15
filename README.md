@@ -81,7 +81,7 @@ src/
 
 ## status
 
-This is a prototype. It runs real GGUF models end-to-end on CPU but is not optimized to match llama.cpp speed. The main gaps are quantized matmul, multi-threading, and more architectures.
+It runs real GGUF models end-to-end on CPU but is not optimized to match llama.cpp speed. The main gaps are quantized matmul, multi-threading, and more architectures.
 
 ## license
 
